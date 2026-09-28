@@ -38,7 +38,7 @@ PROVIDER_OPENROUTER = "openrouter"
 BLUE_PROVIDER = PROVIDER_OPENROUTER
 BLUE_MODEL = "liquid/lfm-2.5-2.6b"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = BLUE_MODEL  # alias
+DEFAULT_OPENROUTER_MODEL = BLUE_MODEL + ":free"   # OpenRouter endpoint cần đuôi :free
 
 # --- Red Team ---
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"

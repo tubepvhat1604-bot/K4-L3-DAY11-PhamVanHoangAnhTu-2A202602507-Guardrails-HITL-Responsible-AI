@@ -1,3 +1,17 @@
+<!-- ============================================================ -->
+<!-- ĐIỀN THÔNG TIN CÁ NHÂN TRƯỚC KHI NỘP -->
+<!-- ============================================================ -->
+> **Họ và tên:** Phạm Văn Hoàng Anh Tú
+> **MSSV:** 2A202602507
+> **Provider Red team đã dùng:** `openai` (`gpt-4o-mini`) — sửa nếu bạn dùng Gemini
+> **Bonus đã chọn:** B1 (leak Red)
+>
+> **Cách chạy nhanh:** `python src/main.py --part 3` (sinh `results.json`), rồi
+> `python src/main.py --part 4` (sinh `attack_results.json`), rồi
+> `python scripts/grade.py --submission-dir . --out outputs/grade_report.json`.
+
+---
+
 # Day 11 — Controlled Agent Security (2026)
 
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  

@@ -49,7 +49,7 @@ class OpenAIRunner:
     def _client(self):
         from openai import OpenAI
 
-        return OpenAI(**(self.client_kwargs or {}))
+        return OpenAI(timeout=12, max_retries=1, **(self.client_kwargs or {}))
 
     async def chat(self, agent: OpenAIAgent, user_message: str) -> str:
         for hook in self.input_hooks:
@@ -63,14 +63,16 @@ class OpenAIRunner:
 
         client = self._client()
         completion = client.chat.completions.create(
-            model=self.model,
+            model=(self.model + ":free" if self.model == "liquid/lfm-2.5-2.6b" else self.model),
+            max_tokens=1024,
             messages=[
                 {"role": "system", "content": agent.instruction},
                 {"role": "user", "content": user_message},
             ],
             temperature=self.temperature,
         )
-        text = (completion.choices[0].message.content or "").strip()
+        _msg = completion.choices[0].message
+        text = (_msg.content or getattr(_msg, "reasoning", None) or "").strip()
 
         for hook in self.output_hooks:
             text = hook(text)

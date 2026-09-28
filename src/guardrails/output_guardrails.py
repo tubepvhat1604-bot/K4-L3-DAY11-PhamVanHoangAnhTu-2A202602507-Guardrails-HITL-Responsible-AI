@@ -27,37 +27,95 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Liên hệ CHÍNH THỨC được phép xuất hiện (không phải PII) — xem ground_truth
+# trong data/pii_hallucination_samples.json.
+OFFICIAL_CONTACT_ALLOWLIST = {"support@vinbank.example"}
+
+# Thứ tự quan trọng: secret/key trước, rồi CCCD (12 số) trước SĐT.
+PII_PATTERNS = {
+    # Secret nội bộ (DB host dạng *.internal[:port])
+    "internal_host": r"\b[\w.-]+\.internal(?::\d{2,5})?\b",
+    # API key kiểu sk-xxxx
+    "api_key": r"\bsk-[A-Za-z0-9_-]{6,}",
+    # password is X / password=X / mật khẩu: X
+    "password": r"\b(?:password|passwd|pwd|mat khau|mật khẩu)\b\s*(?:is|là|=|:)\s*[\"'`]?[^\s\"'`,;]+",
+    # Email
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}",
+    # CCCD 12 số / CMND 9 số (không dính dấu chấm/phẩy để tránh số tiền 500.000.000)
+    "national_id": r"(?<!\d)(?<!\d[.,])(?:\d{12}|\d{9})(?!\d)(?![.,]\d)",
+    # SĐT VN: 0xxxxxxxxx (10–11 số) hoặc +84xxxxxxxxx
+    "phone": r"(?<!\d)(?<!\d[.,])(?:\+84|0)\d{9,10}(?!\d)(?![.,]\d)",
+}
+
+# Các issue được coi là LỘ SECRET (khác với PII khách hàng).
+SECRET_ISSUE_TYPES = {"secret_value", "internal_host", "api_key", "password", "obfuscated_secret"}
+
+SAFE_FALLBACK_MESSAGE = (
+    "I cannot share internal system details. "
+    "How else can I help with your VinBank account or banking needs?"
+)
+
+
+def _known_secrets() -> list[str]:
+    try:
+        from core.config import DEMO_SECRETS
+        return [s for s in DEMO_SECRETS if s]
+    except Exception:
+        return ["admin123", "sk-vinbank-secret-2024", "db.vinbank.internal"]
+
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
-    Args:
-        response: The LLM's response text
-
     Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
+        dict with 'safe', 'issues', 'redacted' (+ 'issue_types' để pipeline dùng)
     """
-    issues = []
-    redacted = response
+    issues: list[str] = []
+    issue_types: list[str] = []
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    def _add(name: str, count: int):
+        if count:
+            issues.append(f"{name}: {count} found")
+            issue_types.append(name)
 
+    # (a) Regex PII / secret tổng quát
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+        hits = 0
+
+        def _sub(m, _name=name):
+            nonlocal hits
+            if _name == "email" and m.group(0).lower() in OFFICIAL_CONTACT_ALLOWLIST:
+                return m.group(0)
+            hits += 1
+            return "[REDACTED]"
+
+        redacted = re.sub(pattern, _sub, redacted, flags=re.IGNORECASE)
+        _add(name, hits)
+
+    # (b) Giá trị secret DEMO xuất hiện nguyên văn (vd "admin123")
+    count = 0
+    for secret in sorted(_known_secrets(), key=len, reverse=True):
+        rx = re.compile(re.escape(secret), re.IGNORECASE)
+        redacted, n = rx.subn("[REDACTED]", redacted)
+        count += n
+    _add("secret_value", count)
+
+    # (c) Secret bị "ngụy trang" (a-d-m-i-n-1-2-3, a d m i n 1 2 3 ...):
+    #     regex không bắt được vị trí → chặn toàn bộ câu trả lời (fail-closed).
+    flat = _alnum(redacted.replace("[REDACTED]", ""))
+    if any(_alnum(s) and _alnum(s) in flat for s in _known_secrets()):
+        _add("obfuscated_secret", 1)
+        redacted = SAFE_FALLBACK_MESSAGE
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
+        "issue_types": issue_types,
         "redacted": redacted,
     }
 
@@ -149,6 +207,9 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        # Trạng thái lần gọi gần nhất: None | "redacted" | "blocked"
+        self.last_action: str | None = None
+        self.last_issue_types: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -167,21 +228,39 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_action = None
+        self.last_issue_types = []
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex filter (PII + secret)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            self.last_issue_types = list(result["issue_types"])
+            if result["redacted"] == SAFE_FALLBACK_MESSAGE:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+            else:
+                self.last_action = "redacted"
+            llm_response.content = types.Content(
+                role="model", parts=[types.Part.from_text(text=result["redacted"])]
+            )
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. (optional) LLM-as-Judge
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = types.Content(
+                    role="model", parts=[types.Part.from_text(text=SAFE_FALLBACK_MESSAGE)]
+                )
+
+        return llm_response
 
 
 # ============================================================
@@ -209,6 +288,20 @@ def test_content_filter():
         if result["issues"]:
             print(f"           Issues: {result['issues']}")
             print(f"           Redacted: {result['redacted'][:80]}...")
+
+    # Đối chiếu với dataset lab (pii_cases)
+    data = load_lab_pii_dataset()
+    ok = 0
+    cases = data.get("pii_cases", [])
+    print("\nChecking data/pii_hallucination_samples.json (pii_cases):")
+    for case in cases:
+        r = content_filter(case["input_text"])
+        expected = set(case.get("expect_issue_types") or [])
+        got = set(r["issue_types"])
+        passed = (r["safe"] == case["expect_safe"]) and expected.issubset(got)
+        ok += passed
+        print(f"  [{'PASS' if passed else 'FAIL'}] {case['id']} -> {r['redacted'][:70]}")
+    print(f"  {ok}/{len(cases)} PII cases match expectations")
 
 
 def load_lab_pii_dataset():
